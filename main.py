@@ -155,7 +155,7 @@ _opening: dict     = {}   # (conv_id, account_label) -> asyncio.Event
 _page_lock         = asyncio.Lock()
 
 async def ensure_browser():
-    """Connects/reconnects to Browserless with explicit timeout controls."""
+    """Connects/reconnects to Browserless with plan-compliant timeout limit (120000ms)."""
     global _pw_instance, _browser, _pages, _opening
     
     if _pw_instance is None:
@@ -168,8 +168,8 @@ async def ensure_browser():
         _pages.clear()
         _opening.clear()
         
-        # Extended timeout parameters (300,000ms = 5 mins per connection + keepalive)
-        ws_endpoint = f"wss://chrome.browserless.io?token={BROWSERLESS_KEY}&timeout=300000&keepalive=true"
+        # Max plan timeout allowed by Browserless is 120000ms (2 minutes)
+        ws_endpoint = f"wss://chrome.browserless.io?token={BROWSERLESS_KEY}&timeout=120000&keepalive=true"
         _browser = await _pw_instance.chromium.connect_over_cdp(ws_endpoint)
         print(f"[{now()}] ✅ Connected to Browserless successfully")
 
@@ -259,7 +259,7 @@ async def get_latest_screenshot(conv_id: str, account: dict, force: bool = False
         print(f"[{now()}] 🗑️ Tab closed: {conv_id} [Acc{account['LABEL']}]")
 
     async def schedule_close():
-        await asyncio.sleep(15 * 60)
+        await asyncio.sleep(110) # Auto-cleanup shortly before Browserless 120s limit
         await close_page()
 
     asyncio.create_task(schedule_close())
