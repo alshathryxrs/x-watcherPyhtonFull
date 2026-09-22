@@ -104,7 +104,7 @@ _page_lock         = asyncio.Lock()
 async def init_browser():
     global _browser
     pw = await async_playwright().start()
-    _browser = await pw.chromium.launch(headless=False, args=["--no-sandbox", "--window-size=1400,900"])
+    _browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--window-size=1400,900"])
     print(f"[{now()}] ✅ Browser ready")
 
 async def open_chat(conv_id: str, account: dict) -> Page:
