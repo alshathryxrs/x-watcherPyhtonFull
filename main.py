@@ -26,8 +26,9 @@ TELEGRAM_TOKEN   = "8630469503:AAHqID7tpgZ49_p_DgfIIhgt5CkBPO_MkQo"
 TELEGRAM_CHAT_ID = "6607397366"
 USER_AGENT       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:155.0) Gecko/20100101 Firefox/155.0"
 HEARTBEAT_B64    = "DAACDAACAAAA"
-PRESENCE_TIMEOUT = 20  # covers full browser chat open time
+PRESENCE_TIMEOUT = 20  
 XCHAT_PASSCODE   = "0807"
+BROWSERLESS_KEY  = "2VJ6TPwl5gUfRJ6d0f0b13100be31ef626d653ea91f852dc4"
 
 # ==================== USER ID FILTERS ====================
 TARGET_USER_ID = "1885488902670000129"
@@ -70,8 +71,31 @@ def is_muted(conv_id: str) -> bool:
     return conv_id in _presence
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM SETUP & FUNCTIONS
 # ============================================================
+
+def get_menu_keyboard():
+    return {
+        "inline_keyboard": [
+            [{"text": "🎯 Target (Acc 1)", "callback_data": "target"}, {"text": "🎯 Target (Acc 2)", "callback_data": "target2"}],
+            [{"text": "🌸 Reem (Acc 1)", "callback_data": "reem"}, {"text": "🌸 Reem (Acc 2)", "callback_data": "reem2"}],
+            [{"text": "🌺 Noora (Acc 1)", "callback_data": "noora"}, {"text": "🌺 Noora (Acc 2)", "callback_data": "noora2"}],
+            [{"text": "🌼 Jamila (Acc 1)", "callback_data": "jamila"}, {"text": "🌼 Jamila (Acc 2)", "callback_data": "jamila2"}]
+        ]
+    }
+
+async def set_bot_commands() -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands"
+    commands = [
+        {"command": "start", "description": "Open Options Menu"},
+        {"command": "menu", "description": "Open Options Menu"},
+    ]
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(url, json={"commands": commands})
+        print(f"[{now()}] 🤖 Telegram command menu registered")
+    except Exception as e:
+        print(f"[{now()}] ⚠️ Failed to set Telegram commands: {e}")
 
 async def send_telegram(title: str, message: str, show_keyboard: bool = False) -> None:
     text = f"*{title}*\n{message}"
@@ -83,18 +107,8 @@ async def send_telegram(title: str, message: str, show_keyboard: bool = False) -
         "parse_mode": "Markdown",
     }
     
-    # Inject the persistent custom keyboard if requested
     if show_keyboard:
-        payload["reply_markup"] = {
-            "keyboard": [
-                [{"text": "target"}, {"text": "target2"}],
-                [{"text": "reem"}, {"text": "reem2"}],
-                [{"text": "noora"}, {"text": "noora2"}],
-                [{"text": "jamila"}, {"text": "jamila2"}]
-            ],
-            "resize_keyboard": True,
-            "is_persistent": True
-        }
+        payload["reply_markup"] = get_menu_keyboard()
 
     for attempt in range(1, 4):
         try:
@@ -115,6 +129,7 @@ async def send_telegram_photo(caption: str, image_bytes: bytes) -> None:
                 r = await client.post(url, data={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "caption": caption,
+                    "reply_markup": json.dumps(get_menu_keyboard())
                 }, files={
                     "photo": ("msg.png", image_bytes, "image/png"),
                 })
@@ -122,7 +137,7 @@ async def send_telegram_photo(caption: str, image_bytes: bytes) -> None:
                 print(f"[{now()}] ✅ Photo sent to Telegram")
                 return
             else:
-                print(f"[{now()}] ⚠️  Telegram photo HTTP {r.status_code}: {r.text[:200]}")
+                print(f"[{now()}] ⚠️ Telegram photo HTTP {r.status_code}: {r.text[:200]}")
         except Exception as e:
             print(f"[{now()}] Telegram photo attempt {attempt}/3 failed: {e}")
         if attempt < 3:
@@ -132,20 +147,35 @@ async def send_telegram_photo(caption: str, image_bytes: bytes) -> None:
 # BROWSER / DOM MESSAGE READER
 # ============================================================
 
+_pw_instance       = None
 _browser: Browser  = None
 _pages: dict       = {}   # (conv_id, account_label) -> Page
 _last_id: dict     = {}   # (conv_id, account_label) -> last message id
 _opening: dict     = {}   # (conv_id, account_label) -> asyncio.Event
 _page_lock         = asyncio.Lock()
 
-async def init_browser():
-    global _browser
-    pw = await async_playwright().start()
-    # Updated to headless=True for cloud execution
-    _browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--window-size=1400,900"])
-    print(f"[{now()}] ✅ Browser ready")
+async def ensure_browser():
+    """Connects/reconnects to Browserless with explicit timeout controls."""
+    global _pw_instance, _browser, _pages, _opening
+    
+    if _pw_instance is None:
+        _pw_instance = await async_playwright().start()
+
+    if _browser is None or not _browser.is_connected():
+        if _browser is not None:
+            print(f"[{now()}] 🔄 Connection lost. Reconnecting to Browserless...")
+            
+        _pages.clear()
+        _opening.clear()
+        
+        # Extended timeout parameters (300,000ms = 5 mins per connection + keepalive)
+        ws_endpoint = f"wss://chrome.browserless.io?token={BROWSERLESS_KEY}&timeout=300000&keepalive=true"
+        _browser = await _pw_instance.chromium.connect_over_cdp(ws_endpoint)
+        print(f"[{now()}] ✅ Connected to Browserless successfully")
 
 async def open_chat(conv_id: str, account: dict) -> Page:
+    await ensure_browser()
+    
     key       = (conv_id, account["LABEL"])
     dash_conv = conv_id.replace(":", "-")
     print(f"[{now()}] 📂 Opening chat: {dash_conv} [Acc{account['LABEL']}]")
@@ -186,7 +216,7 @@ async def open_chat(conv_id: str, account: dict) -> Page:
 
     def cleanup():
         _pages.pop(key, None)
-        print(f"[{now()}] ⚠️  Page closed: {dash_conv} [Acc{account['LABEL']}]")
+        print(f"[{now()}] ⚠️ Page closed: {dash_conv} [Acc{account['LABEL']}]")
 
     page.on("close", lambda: cleanup())
     page.on("crash", lambda: cleanup())
@@ -197,7 +227,7 @@ async def open_chat(conv_id: str, account: dict) -> Page:
     return page
 
 async def get_latest_screenshot(conv_id: str, account: dict, force: bool = False):
-    key      = (conv_id, account["LABEL"])
+    key = (conv_id, account["LABEL"])
 
     async with _page_lock:
         if key not in _pages:
@@ -226,10 +256,10 @@ async def get_latest_screenshot(conv_id: str, account: dict, force: bool = False
         except Exception:
             pass
         _pages.pop(key, None)
-        print(f"[{now()}] 🗑️  Tab closed: {conv_id} [Acc{account['LABEL']}]")
+        print(f"[{now()}] 🗑️ Tab closed: {conv_id} [Acc{account['LABEL']}]")
 
     async def schedule_close():
-        await asyncio.sleep(30 * 60)
+        await asyncio.sleep(15 * 60)
         await close_page()
 
     asyncio.create_task(schedule_close())
@@ -297,7 +327,7 @@ async def get_latest_screenshot(conv_id: str, account: dict, force: bool = False
         return screenshot, new_id
 
     except Exception as e:
-        print(f"[{now()}] ⚠️  Screenshot failed: {e} — shooting anyway")
+        print(f"[{now()}] ⚠️ Screenshot failed: {e} - shooting anyway")
         try:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             screenshot = await page.screenshot(type="png", full_page=False)
@@ -436,7 +466,7 @@ async def handle_frame(buf: bytes, account: dict) -> None:
         if my_id not in msg["conv_id"].split(":"): return
         if is_muted(msg["conv_id"]): return
         name = get_label(sid)
-        print(f"[{now()}] 💬 [Acc{lbl}] {name} — new message detected")
+        print(f"[{now()}] 💬 [Acc{lbl}] {name} - new message detected")
         return
 
     try:
@@ -523,16 +553,16 @@ async def monitor(account: dict) -> None:
                         elif msg.type == aiohttp.WSMsgType.TEXT:
                             await handle_frame(msg.data.encode(), account)
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
-                            print(f"[{now()}] 🔴 {tag} WS closed — reconnecting in {backoff}s")
+                            print(f"[{now()}] 🔴 {tag} WS closed - reconnecting in {backoff}s")
                             break
                         elif msg.type == aiohttp.WSMsgType.ERROR:
-                            print(f"[{now()}] ❌ {tag} WS error — reconnecting in {backoff}s")
+                            print(f"[{now()}] ❌ {tag} WS error - reconnecting in {backoff}s")
                             break
 
         except asyncio.TimeoutError:
-            print(f"[{now()}] ⏱ {tag} Timeout — reconnecting in {backoff}s")
+            print(f"[{now()}] ⏱ {tag} Timeout - reconnecting in {backoff}s")
         except Exception as e:
-            print(f"[{now()}] ❌ {tag} {type(e).__name__}: {e} — reconnecting in {backoff}s")
+            print(f"[{now()}] ❌ {tag} {type(e).__name__}: {e} - reconnecting in {backoff}s")
 
         await asyncio.sleep(backoff)
 
@@ -553,7 +583,8 @@ COMMAND_MAP = {
 
 async def telegram_poll() -> None:
     offset = 0
-    url_get  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    url_get = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    url_ans = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
     print(f"[{now()}] 🤖 Telegram command polling started")
 
     while True:
@@ -562,7 +593,7 @@ async def telegram_poll() -> None:
                 r = await client.get(url_get, params={
                     "offset":          offset,
                     "timeout":         30,
-                    "allowed_updates": ["message"],
+                    "allowed_updates": ["message", "callback_query"],
                 })
             if not r.is_success:
                 await asyncio.sleep(5)
@@ -571,23 +602,38 @@ async def telegram_poll() -> None:
             updates = r.json().get("result", [])
             for update in updates:
                 offset = update["update_id"] + 1
-                msg = update.get("message", {})
-                if str(msg.get("chat", {}).get("id")) != TELEGRAM_CHAT_ID:
-                    continue
-                text = (msg.get("text") or "").strip().lower()
-                if not text:
+                
+                cmd = None
+                chat_id = None
+                
+                if "callback_query" in update:
+                    cb = update["callback_query"]
+                    chat_id = str(cb.get("message", {}).get("chat", {}).get("id"))
+                    cmd = cb.get("data", "").strip().lower()
+                    
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        await client.post(url_ans, json={"callback_query_id": cb.get("id")})
+
+                elif "message" in update:
+                    msg = update["message"]
+                    chat_id = str(msg.get("chat", {}).get("id"))
+                    text = (msg.get("text") or "").strip().lower()
+                    if text.startswith("/"):
+                        text = text[1:]
+                    cmd = text
+
+                if chat_id != TELEGRAM_CHAT_ID or not cmd:
                     continue
 
-                print(f"[{now()}] 🤖 Command received: {text}")
+                print(f"[{now()}] 🤖 Command received: {cmd}")
 
-                # Check for start/menu commands to trigger the keyboard
-                if text in ["/start", "/menu", "menu"]:
+                if cmd in ["start", "menu"]:
                     await send_telegram("Bot Menu", "Select an account to screenshot:", show_keyboard=True)
                     continue
 
-                entries = COMMAND_MAP.get(text)
+                entries = COMMAND_MAP.get(cmd)
                 if not entries:
-                    await send_telegram("Bot", f"Unknown name: {text}\nPlease use the menu.", show_keyboard=True)
+                    await send_telegram("Bot", f"Unknown command: {cmd}\nPlease use the menu below:", show_keyboard=True)
                     continue
 
                 sent = False
@@ -597,17 +643,17 @@ async def telegram_poll() -> None:
                         force  = key in _pages
                         screenshot, _ = await get_latest_screenshot(conv_id, account, force=force)
                         if screenshot:
-                            await send_telegram_photo(f"{text.capitalize()} {account['LABEL']}", screenshot)
+                            await send_telegram_photo(f"{cmd.capitalize()} {account['LABEL']}", screenshot)
                             sent = True
                             break
                     except Exception as e:
-                        print(f"[{now()}] ⚠️  Command screenshot failed [Acc{account['LABEL']}]: {e}")
+                        print(f"[{now()}] ⚠️ Command screenshot failed [Acc{account['LABEL']}]: {e}")
 
                 if not sent:
-                    await send_telegram("Bot", f"Could not capture {text.capitalize()}'s chat")
+                    await send_telegram("Bot", f"Could not capture {cmd.capitalize()}'s chat", show_keyboard=True)
 
         except Exception as e:
-            print(f"[{now()}] ⚠️  Telegram poll error: {e}")
+            print(f"[{now()}] ⚠️ Telegram poll error: {e}")
             await asyncio.sleep(5)
 
 # ============================================================
@@ -615,7 +661,9 @@ async def telegram_poll() -> None:
 # ============================================================
 
 async def main():
-    await init_browser()
+    await set_bot_commands()
+    await send_telegram("🟢 Bot Online", "Select an account to view:", show_keyboard=True)
+    await ensure_browser()
     await asyncio.gather(
         monitor(ACCOUNT1),
         monitor(ACCOUNT2),
