@@ -73,21 +73,58 @@ def is_muted(conv_id: str) -> bool:
 # TELEGRAM
 # ============================================================
 
-async def send_telegram(title: str, message: str) -> None:
+async def send_telegram(title: str, message: str, show_keyboard: bool = False) -> None:
     text = f"*{title}*\n{message}"
     url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    
+    payload = {
+        "chat_id":    TELEGRAM_CHAT_ID,
+        "text":       text,
+        "parse_mode": "Markdown",
+    }
+    
+    # Inject the persistent custom keyboard if requested
+    if show_keyboard:
+        payload["reply_markup"] = {
+            "keyboard": [
+                [{"text": "target"}, {"text": "target2"}],
+                [{"text": "reem"}, {"text": "reem2"}],
+                [{"text": "noora"}, {"text": "noora2"}],
+                [{"text": "jamila"}, {"text": "jamila2"}]
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True
+        }
+
     for attempt in range(1, 4):
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
-                r = await client.post(url, json={
-                    "chat_id":    TELEGRAM_CHAT_ID,
-                    "text":       text,
-                    "parse_mode": "Markdown",
-                })
+                r = await client.post(url, json=payload)
             if r.is_success:
                 return
         except Exception as e:
             print(f"[{now()}] Telegram attempt {attempt}/3 failed: {e}")
+        if attempt < 3:
+            await asyncio.sleep(2 * attempt)
+
+async def send_telegram_photo(caption: str, image_bytes: bytes) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.post(url, data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": caption,
+                }, files={
+                    "photo": ("msg.png", image_bytes, "image/png"),
+                })
+            if r.is_success:
+                print(f"[{now()}] ✅ Photo sent to Telegram")
+                return
+            else:
+                print(f"[{now()}] ⚠️  Telegram photo HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            print(f"[{now()}] Telegram photo attempt {attempt}/3 failed: {e}")
         if attempt < 3:
             await asyncio.sleep(2 * attempt)
 
@@ -104,6 +141,7 @@ _page_lock         = asyncio.Lock()
 async def init_browser():
     global _browser
     pw = await async_playwright().start()
+    # Updated to headless=True for cloud execution
     _browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--window-size=1400,900"])
     print(f"[{now()}] ✅ Browser ready")
 
@@ -112,14 +150,11 @@ async def open_chat(conv_id: str, account: dict) -> Page:
     dash_conv = conv_id.replace(":", "-")
     print(f"[{now()}] 📂 Opening chat: {dash_conv} [Acc{account['LABEL']}]")
 
-    # Mark presence NOW before page loads — browser will trigger seen receipt,
-    # this ensures it's already muted when the WS frame arrives
     mark_presence(conv_id)
 
     page = await _browser.new_page(viewport={"width": 1400, "height": 900})
     await page.set_extra_http_headers({"User-Agent": USER_AGENT})
 
-    # Use correct account cookies
     await page.context.add_cookies([
         {"name": "auth_token", "value": account["AUTH_TOKEN"], "domain": ".x.com", "path": "/"},
         {"name": "ct0",        "value": account["CT0"],        "domain": ".x.com", "path": "/"},
@@ -127,7 +162,6 @@ async def open_chat(conv_id: str, account: dict) -> Page:
 
     await page.goto(f"https://x.com/i/chat/{dash_conv}", wait_until="load", timeout=60000)
 
-    # Handle passcode
     try:
         await page.wait_for_selector("input[inputmode='numeric']", timeout=8000)
         for digit in XCHAT_PASSCODE:
@@ -138,10 +172,8 @@ async def open_chat(conv_id: str, account: dict) -> Page:
     except Exception:
         pass
 
-    # Wait for composer
     await page.wait_for_selector("[data-testid='dm-composer-textarea']", timeout=30000)
 
-    # Wait until messages are decrypted and visible
     await page.wait_for_function("""
         () => {
             const msgs = document.querySelectorAll('[data-testid^="message-text-"]');
@@ -160,18 +192,11 @@ async def open_chat(conv_id: str, account: dict) -> Page:
     page.on("crash", lambda: cleanup())
 
     _pages[key] = page
-    # Opening the chat via browser marks messages as read on X's side,
-    # which sends a seen frame back — mute it so we don't notify ourselves
     mark_presence(conv_id)
     print(f"[{now()}] ✅ Chat ready: {dash_conv} [Acc{account['LABEL']}]")
     return page
 
 async def get_latest_screenshot(conv_id: str, account: dict, force: bool = False):
-    """
-    Waits for a new message to appear then screenshots.
-    force=True: skip new-message wait, just scroll and shoot immediately.
-    Returns (screenshot_bytes, known_id) or (None, None).
-    """
     key      = (conv_id, account["LABEL"])
 
     async with _page_lock:
@@ -204,12 +229,11 @@ async def get_latest_screenshot(conv_id: str, account: dict, force: bool = False
         print(f"[{now()}] 🗑️  Tab closed: {conv_id} [Acc{account['LABEL']}]")
 
     async def schedule_close():
-        await asyncio.sleep(30 * 60)  # 30 minutes
+        await asyncio.sleep(30 * 60)
         await close_page()
 
     asyncio.create_task(schedule_close())
 
-    # Force mode — just shoot whatever is on screen right now
     if force:
         try:
             mark_presence(conv_id)
@@ -223,7 +247,6 @@ async def get_latest_screenshot(conv_id: str, account: dict, force: bool = False
             return None, None
 
     try:
-        # Wait until a NEW message element appears
         result = await page.wait_for_function(
             """(knownId) => {
                 const els = document.querySelectorAll('[data-testid^="message-text-"]');
@@ -242,17 +265,13 @@ async def get_latest_screenshot(conv_id: str, account: dict, force: bool = False
 
         _last_id[key] = new_id
 
-        # Scroll to bottom so latest message is visible
-        # Mark presence first — scrolling triggers a seen event on X's side
         mark_presence(conv_id)
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
 
-        # Wait until every <img> inside the last message group is fully decoded
         await page.wait_for_function(
             """(msgId) => {
                 const el = document.querySelector('[data-testid="' + msgId + '"]');
-                if (!el) return true; // element gone, just shoot
-                // find the closest list-item / article ancestor as bubble boundary
+                if (!el) return true;
                 let bubble = el;
                 for (let i = 0; i < 10; i++) {
                     if (!bubble.parentElement) break;
@@ -261,20 +280,18 @@ async def get_latest_screenshot(conv_id: str, account: dict, force: bool = False
                     if (tag === 'li' || tag === 'article') break;
                 }
                 const imgs = Array.from(bubble.querySelectorAll('img'));
-                // filter out tiny icons (avatars etc) — only care about content images
                 const content = imgs.filter(img => {
                     const r = img.getBoundingClientRect();
                     return r.width > 16 && r.height > 16;
                 });
-                if (!content.length) return true; // no content images — ready
+                if (!content.length) return true;
                 return content.every(img => img.complete && img.naturalWidth > 0);
             }""",
             arg=new_id,
             timeout=12000,
         )
 
-        # Full viewport screenshot — everything rendered
-        mark_presence(conv_id)  # re-mark in case image wait took long
+        mark_presence(conv_id)
         screenshot = await page.screenshot(type="png", full_page=False)
         print(f"[{now()}] 📸 Screenshot taken for {new_id}")
         return screenshot, new_id
@@ -288,30 +305,6 @@ async def get_latest_screenshot(conv_id: str, account: dict, force: bool = False
         except Exception as e2:
             print(f"[{now()}] ❌ Fallback screenshot failed: {e2}")
             return None, None
-
-
-
-
-async def send_telegram_photo(caption: str, image_bytes: bytes) -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    for attempt in range(1, 4):
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.post(url, data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "caption": caption,
-                }, files={
-                    "photo": ("msg.png", image_bytes, "image/png"),
-                })
-            if r.is_success:
-                print(f"[{now()}] ✅ Photo sent to Telegram")
-                return
-            else:
-                print(f"[{now()}] ⚠️  Telegram photo HTTP {r.status_code}: {r.text[:200]}")
-        except Exception as e:
-            print(f"[{now()}] Telegram photo attempt {attempt}/3 failed: {e}")
-        if attempt < 3:
-            await asyncio.sleep(2 * attempt)
 
 # ============================================================
 # THRIFT PARSER
@@ -424,7 +417,6 @@ async def handle_frame(buf: bytes, account: dict) -> None:
     lbl   = account["LABEL"]
     my_id = account["MY_USER_ID"]
 
-    # ── READ RECEIPT ─────────────────────────────────────────
     seen = try_parse_seen(buf)
     if seen:
         if seen["reader_id"] == my_id:
@@ -435,7 +427,6 @@ async def handle_frame(buf: bytes, account: dict) -> None:
         print(f"[{now()}] 👁️  [Acc{lbl}] {name} SEEN")
         return
 
-    # ── NEW MESSAGE ──────────────────────────────────────────
     msg = try_parse_message(buf)
     if msg:
         sid = msg["sender_id"]
@@ -448,7 +439,6 @@ async def handle_frame(buf: bytes, account: dict) -> None:
         print(f"[{now()}] 💬 [Acc{lbl}] {name} — new message detected")
         return
 
-    # ── TYPING ───────────────────────────────────────────────
     try:
         cleaned  = "".join(c if 0x20 <= ord(c) <= 0x7E else " "
                            for c in buf.decode("utf-8", errors="replace")).strip()
@@ -550,7 +540,6 @@ async def monitor(account: dict) -> None:
 # TELEGRAM COMMAND POLLING
 # ============================================================
 
-# Name → (conv_id, account) — both accounts for each person
 COMMAND_MAP = {
     "target":   [(f"{ACCOUNT1['MY_USER_ID']}:{TARGET_USER_ID}",  ACCOUNT1)],
     "target2":  [(f"{ACCOUNT2['MY_USER_ID']}:{TARGET_USER_ID}",  ACCOUNT2)],
@@ -583,7 +572,6 @@ async def telegram_poll() -> None:
             for update in updates:
                 offset = update["update_id"] + 1
                 msg = update.get("message", {})
-                # Only accept commands from your own chat
                 if str(msg.get("chat", {}).get("id")) != TELEGRAM_CHAT_ID:
                     continue
                 text = (msg.get("text") or "").strip().lower()
@@ -591,17 +579,22 @@ async def telegram_poll() -> None:
                     continue
 
                 print(f"[{now()}] 🤖 Command received: {text}")
-                entries = COMMAND_MAP.get(text)
-                if not entries:
-                    await send_telegram("Bot", f"Unknown name: {text}\nTry: " + ", ".join(COMMAND_MAP.keys()))
+
+                # Check for start/menu commands to trigger the keyboard
+                if text in ["/start", "/menu", "menu"]:
+                    await send_telegram("Bot Menu", "Select an account to screenshot:", show_keyboard=True)
                     continue
 
-                # Screenshot — force=True if chat already open (retake instantly)
+                entries = COMMAND_MAP.get(text)
+                if not entries:
+                    await send_telegram("Bot", f"Unknown name: {text}\nPlease use the menu.", show_keyboard=True)
+                    continue
+
                 sent = False
                 for conv_id, account in entries:
                     try:
                         key    = (conv_id, account["LABEL"])
-                        force  = key in _pages  # chat already open → shoot immediately
+                        force  = key in _pages
                         screenshot, _ = await get_latest_screenshot(conv_id, account, force=force)
                         if screenshot:
                             await send_telegram_photo(f"{text.capitalize()} {account['LABEL']}", screenshot)
